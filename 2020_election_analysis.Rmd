@@ -1,0 +1,963 @@
+---
+title: "2020 Election Analysis"
+author: "Yuchen Zheng, Kelly Wang"
+date: "12/6/2020"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=F, message=F}
+## loading packages
+library(tidyverse)
+library(ggplot2)
+library(maps)
+library(tree) 
+library(maptree) 
+library(randomForest) 
+library(gbm) 
+library(ROCR)
+library(glmnet)
+library(FNN)
+```
+
+
+## Data 
+```{r, message=F}
+## read data and convert candidate names and party names from string to factor
+election.raw <- read_csv("./2020_election_data/candidates_county.csv", col_names = TRUE) %>% 
+  mutate(candidate = as.factor(candidate), party = as.factor(party))
+
+## remove the word "County" from the county names
+words.to.remove = c("County")
+remove.words <- function(str, words.to.remove){
+  sapply(str, function(str){
+    x <- unlist(strsplit(str, " "))
+    x <- x[!x %in% words.to.remove]
+    return(paste(x, collapse = " "))
+  }, simplify = "array", USE.NAMES = FALSE)
+}
+election.raw$county <- remove.words(election.raw$county, words.to.remove)
+
+## read census data
+census <- read_csv("./2020_election_data/census_county.csv") 
+```
+
+
+## Election data
+1. 
+```{r}
+## dimension
+print(dim(election.raw))
+
+## missing value
+print(as.vector(is.na(election.raw)) %>% unique())
+
+## state 
+print(unique(election.raw$state) %>% length())
+```
+
+Dataset **election.row** has 31167 rows and 5 columns and contains no missing value. The dataset contains 51 distinct values in **state** which means it contains all states and a federal district.
+
+
+## Census data
+2. 
+```{r}
+## dimension
+print(dim(census))
+
+## missing value
+print(as.vector(is.na(census)) %>% unique())
+
+## County in census
+print(unique(census$County) %>% length())
+
+## County in election.raw
+print(unique(election.raw$county) %>% length())
+```
+
+
+Dataset **census** has 3220 rows and 37 columns and it contains missing values. The total number of distinct values in **county** in **census** is 1955. Compared with **election.row**, **census** has less distinct counties.  
+
+
+## Data wrangling
+3.
+```{r, message=F}
+## election.state
+election.state <- election.raw %>% 
+  select(-county) %>% 
+  group_by(candidate, party, state) %>% 
+  summarise(votes=sum(votes))
+
+## election.total
+election.total <- election.raw %>% 
+  select(-c(county, state)) %>% 
+  group_by(candidate,party) %>% 
+  summarise(votes=sum(votes))
+```
+
+
+4.
+```{r}
+## number of named presidential candidates
+nrow(election.total)
+
+## bar plot on log scale
+p <- ggplot(data=election.total, aes(x=candidate, y=log(votes))) + 
+  geom_bar(stat="identity", width=0.5)
+p + coord_flip()
+```
+
+There are 38 named presidential candidates in 2020 Election.
+
+
+5.
+```{r, message=F}
+## county winner
+county.winner <- election.raw %>% 
+  group_by(county, state) %>% 
+  mutate(total=sum(votes), pct=votes/total)  %>% 
+  top_n(1)
+
+## state.winner
+state.winner <- election.state %>% 
+  group_by(state) %>% 
+  mutate(total=sum(votes), pct=votes/total)%>% 
+  top_n(1)
+```
+
+## Visualization
+6.
+```{r}
+states <- map_data("state")
+
+ggplot(data = states) + 
+  geom_polygon(aes(x = long, y = lat, fill = region, group = group),
+               color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)  # color legend is unnecessary and takes too long
+
+```
+
+```{r}
+counties<- map_data("county")
+
+ggplot(data = counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = subregion, group = group),
+               color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)  # color legend is unnecessary and takes too long
+
+```
+
+7.
+```{r}
+colnames(states)[which(names(states) == "region")] <- "state"
+states<-states %>% mutate(state=str_to_title(state))
+state.combined<-left_join(states, state.winner, by="state")
+
+#color the map by the winning candidate for each state
+ggplot(data = state.combined) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group),
+               color = "white") + 
+  coord_fixed(1.3) 
+```
+
+8.
+```{r}
+ca.county.winner<- county.winner %>% filter(state =="California") 
+
+ca.county <- counties %>% filter(region=="california")
+
+colnames(ca.county)[which(names(ca.county) == "subregion")] <- "county"
+ca.county<-ca.county %>% mutate(county=str_to_title(county))
+ca.county.combined<-left_join(ca.county, ca.county.winner, by="county")
+
+ggplot(data = ca.county.combined) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group),
+               color = "white") + 
+  coord_fixed(1.3) 
+```
+
+9.
+```{r}
+#remove IncomeErr, IncomePerCapErr, CounId, County
+census.state1<- select(census, -c(IncomeErr, IncomePerCapErr, CountyId, County, MeanCommute))
+#replace NA value with 0
+census.state1 <- census.state1%>%mutate_all(~ifelse(is.na(.), 0,.)) 
+
+#convert columns from percentage to count
+census.state2 <- 
+ census.state1 %>% mutate_at(vars(Hispanic:Pacific,Poverty:WorkAtHome,PrivateWork:Unemployment), ~./100*TotalPop)
+
+#group by state 
+census.state <- 
+  census.state2 %>% group_by(State) %>% summarise_all(sum) %>% mutate_at(vars(VotingAgeCitizen, Poverty:ChildPoverty), ~./TotalPop*100)
+```
+
+```{r}
+#plot gender 
+state <- NULL
+for (i in 1:nrow(census.state)) {
+  state <- c(state, rep(as.character(census.state[i,1]), 2))
+}
+
+gender <- rep(c("Male", "Female") , nrow(census.state))
+
+population <- NULL
+for (i in 1:nrow(census.state)) {
+  population <- c(population, as.numeric(census.state[i,3]), as.numeric(census.state[i,4]))
+}
+
+gender.state <- as.data.frame(state, gender, population)
+
+# plot
+gender_p <- ggplot(gender.state, aes(fill=gender, y=population, x=state)) + 
+  geom_bar(position="fill", stat="identity") 
+gender_p + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +labs(title="Gender in Each State")
+```
+
+```{r}
+#Race
+state2 <- NULL
+for (i in 1:nrow(census.state)) {
+  state2 <- c(state2, rep(as.character(census.state[i,1]), 6))
+}
+
+race <- rep(c("Hispanic", "White","Black","Native","Asian","Pacific") , nrow(census.state))
+
+population2 <- NULL
+for (i in 1:nrow(census.state)) {
+  population2 <- c(population2, as.numeric(census.state[i,5]), as.numeric(census.state[i,6]), as.numeric(census.state[i,7]),as.numeric(census.state[i,8]), as.numeric(census.state[i,9]),as.numeric(census.state[i,10]))
+}
+
+race.state <- as.data.frame(state2, race, population2)
+
+#plot
+race_p <- ggplot(race.state, aes(fill=race, y=population2, x=state2)) + 
+  geom_bar(position="fill", stat="identity") 
+race_p + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+scale_fill_brewer(palette="Set3")+ labs(title="Race in Each State")
+```
+
+```{r}
+#Occupation
+state3 <- NULL
+for (i in 1:nrow(census.state)) {
+  state3 <- c(state3, rep(as.character(census.state[i,1]), 5))
+}
+
+Occupation <- rep(c("Professional", "Service","Office","Construction","Production") , nrow(census.state))
+
+
+population3 <- NULL
+for (i in 1:nrow(census.state)) {
+  population3 <- c(population3, as.numeric(census.state[i,16]), as.numeric(census.state[i,17]),as.numeric(census.state[i,18]), as.numeric(census.state[i,19]),as.numeric(census.state[i,20]))
+}
+
+Occupation.state <- as.data.frame(state3, Occupation, population3)
+
+#plot
+occupation_p <- ggplot(Occupation.state, aes(fill=Occupation, y=population3, x=state3)) + 
+  geom_bar(position="fill", stat="identity") 
+occupation_p + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+scale_fill_brewer(palette="Set3") + labs(title="Occupation in Each State")
+```
+
+```{r}
+#Transportation
+state4 <- NULL
+for (i in 1:nrow(census.state)) {
+  state4 <- c(state4, rep(as.character(census.state[i,1]), 6))
+}
+
+transportation <- rep(c("Drive", "CarPool","Transit","Walk","OtherTransp","WorkAtHome") , nrow(census.state))
+
+population4 <- NULL
+for (i in 1:nrow(census.state)) {
+  population4 <- c(population4, as.numeric(census.state[i,21]), as.numeric(census.state[i,22]), as.numeric(census.state[i,23]),as.numeric(census.state[i,24]), as.numeric(census.state[i,25]),as.numeric(census.state[i,26]))
+}
+
+transportation.state <- as.data.frame(state4, transportation, population4)
+
+#plot
+transportation_p <- ggplot(transportation.state, aes(fill=transportation, y=population4, x=state4)) + 
+  geom_bar(position="fill", stat="identity") 
+transportation_p + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+scale_fill_brewer(palette="Set3")+ labs(title="Transportation in Each State")
+```
+
+```{r}
+#Employment
+state5 <- NULL
+for (i in 1:nrow(census.state)) {
+  state5 <- c(state5, rep(as.character(census.state[i,1]), 2))
+}
+
+employment <- rep(c("Employed", "Unemployed") , nrow(census.state))
+
+population5 <- NULL
+for (i in 1:nrow(census.state)) {
+  population5 <- c(population5, as.numeric(census.state[i,27]), as.numeric(census.state[i,32]))
+}
+
+employment.state <- as.data.frame(state5, employment, population5)
+
+#plot
+employment_p <- ggplot(employment.state, aes(fill=employment, y=population5, x=state5)) + 
+  geom_bar(position="fill", stat="identity") 
+employment_p + coord_flip() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+scale_fill_brewer(palette="Set3")+ labs(title="Employment in Each State")
+```
+
+```{r}
+#plot poverty
+poverty <-ggplot(data=census.state, aes(x=State, y=Poverty)) + 
+  geom_bar(stat="identity", width=0.5)
+poverty+coord_flip()
+```
+
+
+
+10.
+```{r}
+#convert to percentage
+census.clean1 <- 
+  census %>% drop_na() %>% mutate(Men = Men/TotalPop*100, Employed = Employed/TotalPop*100, VotingAgeCitizen = VotingAgeCitizen/TotalPop*100)  
+
+#create variable minority
+census.clean2 <- 
+  census.clean1 %>% mutate(Minority = Hispanic+Black+ Native+Asian+Pacific)
+```
+
+```{r}
+#remove extra columns
+census.clean3 <- select(census.clean2, -c(Hispanic, Black, Native, Asian, Pacific, IncomeErr, IncomePerCap, IncomePerCapErr, Walk, PublicWork, Construction))
+#checking collinearity
+cor(census.clean3[,4:27])
+```
+
+From the correlation matrix, we see that the variable Poverty and ChildPoverty are highly correlated with a coefficient of 0.94, women and TotalPop are highly correlated with a coefficient of .999, minority and white are highly correlated with a -0.997 we decided to remove ChildProverty ,Women and Minority from the dataset. 
+
+```{r}
+#remove childpoverty
+census.clean <- select(census.clean3, -c(ChildPoverty,Women,Minority))
+head(census.clean,5)
+```
+
+
+11.
+```{r}
+#examine the data
+summary(census.clean[,4:24])
+apply(census.clean[,4:24],2,var)
+```
+
+We excluded CountyID in this question because it's apparent that countyID is not a charactistic for each observation. Some variables in the dataset such as Men, White, VotingAgeCitizen, etc measures the percentage of the population in each each county, which is not a comparable number to other vairables such as TotalPop which are specific numbers. Thus, we decided to scale the variables and center the mean to 0 before performing PCA. 
+
+```{r}
+#run PCA for the cleaned county level census data
+census.clean.pca <-prcomp(census.clean[,4:24],scale=TRUE, center=TRUE)
+
+#save first two PC into pc.county
+pc.county<-census.clean.pca$x[, 1:2]
+
+pc1.county.loading.scores<-abs(census.clean.pca$rotation[,1])
+pc1.county.loading.scores.sorted<-sort(pc1.county.loading.scores, decreasing=TRUE) 
+head(pc1.county.loading.scores.sorted, 3)
+```
+
+The three features with the largest absolute values of the first principal component are Income, Employed and Poverty.
+
+```{r}
+census.clean.pca$rotation[,1:2]
+```
+
+For loadings of PC1, features VotingAgeCitizen, Poverty, Service, Office, Production, Drive, Carpool, MeanCommute and Unemployment are negative while all other features are positive. For loadings of PC2, features TotalPop, White, Income, Office, Production, Drive, MeanCommute, Employed and PrivateWork are negative while all other features are positive. Features that have negative signs are negatively correlated as one gets more important in defining principle compoents, the others that have negative signs get less important. 
+
+12.
+```{r}
+#the var explained by each principal component
+census.clean.pca.var=census.clean.pca$sdev^2
+#the proportion of variance explained by each principal component
+pve.census = census.clean.pca.var/sum(census.clean.pca.var)
+```
+
+```{r}
+#plot the pve
+plot(pve.census, xlab="Principal Component", ylab="Proportion of Variance Explained", main="PVE", ylim=c(0,0.22), type='b')
+```
+
+```{r}
+#plot cumulative pve
+plot(cumsum(pve.census), xlab="Principal Component", ylab="Cumulative Proportion of Variance Explained",main="Cumulative PVE", ylim=c(0,1), type ='b')
+abline(h=0.9, col="red")
+```
+
+```{r}
+# minimum PC
+minPC <- min(which(cumsum(pve.census) >= 0.9))
+print(paste("minimum PCs capturing 90% of variance:", minPC))
+```
+
+##Clustering
+13.
+```{r}
+#compute a euclidean distance
+s.census.clean<- scale(census.clean[,4:24],center=TRUE, scale=TRUE)
+census.clean.dist <- dist(s.census.clean)
+
+#run hierarchical clustering using original data
+set.seed(1)
+census.clean.hclust = hclust(census.clean.dist)
+census.clean.hclust
+
+
+#cut the tree to 10 clusters
+census.clean.clus = cutree(census.clean.hclust,10)
+table(census.clean.clus)
+
+#find which cluster Santa Barbara County is in
+which(census.clean$County[census.clean.clus == 1] == "Santa Barbara County")
+```
+
+In the hierarchical clustering using the original data, Santa Barbara county is contained in group 1 which has 2845 counties. 
+
+```{r}
+#extract SB census information
+SB.census <- census.clean[228,4:24]
+SB.census<-data.frame(SB.census)
+rownames(SB.census) <- c("SB census info")
+```
+
+```{r}
+#analyze cluster
+clus.info1<-aggregate(census.clean[,4:24],list(census.clean.clus),median)
+SB.census1 <- SB.census %>% mutate(Group.1 = "NA")
+clus.analysis1<-rbind(SB.census1,clus.info1)
+rownames(clus.analysis1) <- c("SB census info","census.clean.clus.g1","census.clean.clus.g2","census.clean.clus.g3","census.clean.clus.g4","census.clean.clus.g5","census.clean.clus.g6","census.clean.clus.g7","census.clean.clus.g8","census.clean.clus.g9","census.clean.clus.g10")
+clus.analysis1
+```
+
+Group 1 are counties that have median size population with a large White population. The medians of TotalPop in group1 and group2 are similar. The major difference between these two groups are group1 has large White population, low poverty level and low unemployment level, and group2 has small white popuation with high poverty level and high unemployment level. 
+
+```{r}
+#compute a euclidean distance
+pc.county.dist <- dist(pc.county)
+
+#run hierarchical clustering using pc.county
+set.seed(1)
+pc.county.hclust = hclust(pc.county.dist)
+pc.county.hclust
+
+#cut the tree to 10 clusters
+pc.county.clus = cutree(pc.county.hclust,10)
+table(pc.county.clus)
+
+#find which cluster Santa Barbara County is in
+which(census.clean$County[pc.county.clus == 4] == "Santa Barbara County")
+```
+
+In the hierarchical clustering using the first two principal components, Santa Barbara county is contained in group 4 which has 627 counties. 
+
+```{r}
+#analyze cluster
+clus.info2<-aggregate(census.clean[,4:24],list(pc.county.clus),median)
+SB.census1 <- SB.census %>% mutate(Group.1 = "NA")
+clus.analysis2<-rbind(SB.census1,clus.info2)
+rownames(clus.analysis2) <- c("SB census info","pc.county.clus.g1","pc.county.clus.g2","pc.county.clus.g3","pc.county.clus.g4","pc.county.clus.g5","pc.county.clus.g6","pc.county.clus.g7","pc.county.clus.g8","pc.county.clus.g9","pc.county.clus.g10")
+clus.analysis2
+
+```
+
+Group 4 are counties that have relatively small TotalPop with a large White population. The medians of TotalPop in group1 and group2 are similar. Santa Barbara county was placed in group 4 because it has low unemployment level and relatively low poverty level.
+
+```{r}
+#investigate the cluster that contains SB county using original data
+census.clean.clus.g1<-aggregate(census.clean[,4:24],list(census.clean.clus),median)[1,-1]
+rownames(census.clean.clus.g1) <- c("census.clean.clus.g1")
+
+
+#investigate the cluster that contains SB county  using pc.county
+pc.county.clus.g4<-aggregate(census.clean[,4:24],list(pc.county.clus),median)[4,-1]
+rownames(pc.county.clus.g4) <- c("pc.county.clus.g4")
+
+#combine rows  
+clus.analysis <- rbind(SB.census,census.clean.clus.g1, pc.county.clus.g4)
+clus.analysis
+```
+
+Both clustering methods put Santa Barbara County in a group which features don't match a lot with Santa Barbara's features. Given the sizes of the cluster that Santa Barbara county is placed in each method, 2485 and 627 respectively for clustering using original data and clustering using the first two principle components, clustering using the first two principle components seem to put Santa Barbara county in a more approriate group because the cluster is smaller.
+
+
+
+## Classification
+```{r}
+# we move all state and county names into lower-case
+tmpwinner <- county.winner %>% ungroup %>%
+  mutate_at(vars(state, county), tolower)
+
+# we move all state and county names into lower-case
+# we further remove suffixes of "county" and "parish"
+tmpcensus <- census.clean %>% mutate_at(vars(State, County), tolower) %>%
+  mutate(County = gsub(" county|  parish", "", County)) 
+
+# we join the two datasets
+election.cl <- tmpwinner %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+# drop levels of county winners if you haven't done so in previous parts
+election.cl$candidate <- droplevels(election.cl$candidate)
+
+## save meta information
+election.meta <- election.cl %>% select(c(county, party, CountyId, state, votes, pct, total))
+
+## save predictors and class labels
+election.cl = election.cl %>% select(-c(county, party, CountyId, state, votes, pct, total))
+```
+
+14. Understand the code above. Why do we need to exclude the predictor party from election.cl? \newline
+
+Because we try to see if we can use census information in a county to predict the winner in that county. The predictor party is not a part of the census information and could be a confounding variable that could interfere our predictions.
+
+```{r}
+set.seed(10) 
+n <- nrow(election.cl)
+idx.tr <- sample.int(n, 0.8*n) 
+election.tr <- election.cl[idx.tr, ]
+election.te <- election.cl[-idx.tr, ]
+```
+
+```{r}
+set.seed(20) 
+nfold <- 10
+folds <- sample(cut(1:nrow(election.tr), breaks=nfold, labels=FALSE))
+```
+
+```{r}
+calc_error_rate = function(predicted.value, true.value){
+  return(mean(true.value!=predicted.value))
+}
+records = matrix(NA, nrow=3, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("tree","logistic","lasso")
+```
+
+
+## Classification
+
+15.
+```{r fig1, fig.height = 12, fig.width = 10}
+# decision tree
+tree.election = tree(candidate ~., data = election.tr)
+
+# prune tree
+cv = cv.tree(tree.election, FUN=prune.misclass, rand = folds)
+best.cv = min(cv$size[cv$dev == min(cv$dev)])
+pt.cv = prune.misclass(tree.election, best=best.cv)
+
+# plot tree
+draw.tree(pt.cv, nodeinfo=TRUE)
+
+# predict and calculate errors
+tree.pred.tr = predict(pt.cv, election.tr, type="class")
+tree.error.tr <- calc_error_rate(tree.pred.tr, election.tr$candidate)
+print(paste("decision tree train error:", tree.error.tr))
+
+tree.pred.te = predict(pt.cv, election.te, type="class")
+tree.error.te <- calc_error_rate(tree.pred.te, election.te$candidate)
+print(paste("decision tree test error:", tree.error.te))
+
+# save errors 
+records[1,1] <- tree.error.tr
+records[1,2] <- tree.error.te
+```
+
+The important variables selected in the decision tree are **Transit**, **White**, **TotalPop**, **Unemployment**, **Service**, **Employed** and **Professional**. Based on the analysis of these variables, we can obtained a total classified correct over 90%.
+
+From the decision tree, we can see that when percent of commuting on public transportation is less than around 1, counties with white people percentage over 50% are more like to vote Donald Trump and counties with white people percentage less than around 50% and unemployment rate over around 6.75% intend to vote for Joe Biden. When percent of commuting on public transportation is over around 1, counties with large population tend to vote for Joe Biden, while counties with small population tend to vote for Donald Trump. Only several large counties with relative high white population percent or low employed rate in professional fields have Donald Trump as their election winner and only several small counties with relative high employed rate in professional fields, low white percentage or high number of employed population have Joe Biden as their election winner. We can see an obvious voting division from employment perspective from the decision tree. Counties with high employed rate in professional fields, high employed population or high unemployment rate intend to have Joe Biden as their election winner. Therefore, people are more confidence in Joe Biden's policies in job markets. Besides, counties with high white population are more likely to vote for Donald Trump.
+
+
+
+16.
+```{r}
+# regression model
+glm.fit = glm(candidate ~., data=election.tr, family=binomial) 
+summary(glm.fit)
+
+# predict and calculate errors
+logistic.tr = predict(glm.fit, election.tr, type = "response")
+logistic.tr = ifelse(logistic.tr > 0.5, 1, 0)
+values.tr = ifelse(election.tr$candidate == "Donald Trump", 0, 1)
+logistic.error.tr <- calc_error_rate(logistic.tr, values.tr)
+print(paste("logistic model train error:", logistic.error.tr))
+
+logistic.te = predict(glm.fit, election.te, type = "response")
+logistic.te = ifelse(logistic.te > 0.5, 1, 0)
+values.te = ifelse(election.te$candidate == "Donald Trump", 0, 1)
+logistic.error.te <- calc_error_rate(logistic.te, values.te)
+print(paste("logistic model test error:", logistic.error.te))
+
+# save errors 
+records[2,1] <- logistic.error.tr
+records[2,2] <- logistic.error.te
+```
+
+The significant variables from logistic regression is **TotalPop**, **White**, **VotingAgeCitizon**, **Professional**, **Service**, **Office**, **Production**, **Drive**, **Carpool**, **Employed**, **PrivateWork** and **Unemployment** since they have p-value less than 0.05. Only **TotalPop**, **White**,  **Professional** and **Unemployment** are selected as important variables in both decision tree and logistic regression so the results are not very consistent. But these four particular variables have very low p-values in logistic regression and play very important role in decision tree as we analyzed before.  
+
+If we increase **VotingAgeCitizen** by one unit, then the additive change of logit for our logistic regression model will be 1.925e-01. Similarly, if we increase **Professional** by one unit, then the additive changes of logit for our logistic model will be 2.878e-01. 
+
+
+17. 
+```{r}
+# split data
+x.train = model.matrix(candidate~., election.tr)
+y.train = election.tr$candidate
+
+# lasso model
+lambda.list.lasso = seq(1, 50) * 1e-4
+lasso.mod = glmnet(x.train, y.train, alpha=1, lambda = lambda.list.lasso, family = "binomial")
+
+# select lambda
+cv.out.lasso = cv.glmnet(x.train, y.train, alpha = 1, lambda = lambda.list.lasso, K=10, family = "binomial") 
+bestlam.lasso = cv.out.lasso$lambda.min
+print(paste("optimal lambda:", bestlam.lasso))
+
+# predict
+predict(lasso.mod, type="coefficients", s=bestlam.lasso)[1:23,]
+```
+
+**Men**, **Income** are zero coefficients, while others are non-zero coefficients. Compared to the unpenalized logistic regression, the lasso model set only two zero coefficients. Unpenalized logistic regression obtains 10 unimportant variables.
+
+
+```{r}
+# train error
+lasso.tr=predict(lasso.mod, s=bestlam.lasso, newx=x.train, type = 'class') 
+lasso.error.tr <- calc_error_rate(lasso.tr, y.train)
+print(paste("lasso model train error:", lasso.error.tr))
+
+# test error
+x.test = model.matrix(candidate~., election.te)
+y.test = election.te$candidate
+lasso.te=predict(lasso.mod, s=bestlam.lasso, newx=x.test, type = 'class') 
+lasso.error.te <- calc_error_rate(lasso.te, y.test)
+print(paste("lasso model test error:", lasso.error.te))
+
+# save errors
+records[3,1] <- lasso.error.te
+records[3,2] <- lasso.error.te
+```
+
+
+18.
+```{r}
+# decision tree ROC 
+tree.pred.prob = predict(pt.cv, election.te)
+pred.tree = prediction(tree.pred.prob[,2], election.te$candidate) 
+perf.tree = performance(pred.tree, measure="tpr", x.measure="fpr") 
+
+# logistic ROC
+logistic.prob.test = predict(glm.fit, election.te)
+pred.logistic = prediction(logistic.prob.test, election.te$candidate) 
+perf.logistic = performance(pred.logistic, measure="tpr", x.measure="fpr")
+
+# lasso ROC
+lasso.prob.test = predict(lasso.mod, s=bestlam.lasso, newx=x.test)
+pred.lasso= prediction(lasso.prob.test, election.te$candidate) 
+perf.lasso = performance(pred.lasso, measure="tpr", x.measure="fpr")
+
+# plot ROC curves
+plot(perf.tree, col=2, lwd=3, main="ROC curves")
+plot(perf.logistic, add = TRUE, col=3, lwd=3)
+plot(perf.lasso, add = TRUE, col=4, lwd=3)
+abline(0,1)
+legend("bottomright", legend = c("Decision Tree", "Logistic", "Lasso"), col = c(2,3,4), lty=1, cex=0.8)
+```
+
+```{r}
+# print error table
+print(records)
+```
+
+
+Decision tree is a non-parametric method, while logistic regression and lasso regression are both parametric methods. Therefore, decision tree is easier to interpret and the decision tree plot is very straight-forward. However, decision tree has largest test error which is most inaccurate and worst performance among three models which can be revealed in the ROC curve. Logistic regression model has second low test error which means it is an effective model in predicting election winner. However, logistic regression sometimes can be overfitting and thus has a low train error but a high test error. Lasso regression can fix the overfitting problem of logistic regression and it sets the unimportant variables to 0 for us automatically. It also the one has lowest test error. However, since lasso set coefficients of unimportant variables as 0 automatically, it can be hard for us to interpret sometimes since we do not know why these coefficients are selected as 0.  In addition, logistic regression and lasso regression have almost the same roc curve which means they have very similar performance. \newline
+
+In terms of accuracy, logistic regression and lasso regression are better choices. But in terms of interpretation, decision is a better choice. 
+
+## Taking it further
+19.
+KNN Classification
+
+```{r}
+# remove candidate and apply pca
+election.tr.pc <- election.tr %>% select(-candidate)
+pr.out=prcomp(election.tr.pc, scale=TRUE)
+print(paste('dimension of PCs:', dim(pr.out$x)))
+```
+
+```{r}
+#plot cumulative pve
+pr.var=pr.out$sdev^2
+pve=pr.var/sum(pr.var)
+plot(cumsum(pve), xlab="Principal Component", ylab="Cumulative Proportion of Variance Explained", ylim=c(0,1), type ='b',
+     main='PC versus PVE')
+abline(h=0.9, col="red")
+
+# minimum PC
+minPC <- min(which(cumsum(pve) >= 0.9))
+print(paste("minimum PCs capturing 90% of variance:", minPC))
+```
+
+
+```{r}
+# select min PCs
+pc.train <- pr.out$x[,1:minPC] %>% scale(center = TRUE, scale = TRUE)
+
+# plot validation error for different k
+allK = 1:50
+validation.error = rep(NA, 50)
+for (i in allK){
+  pred.Yval = knn.cv(train=pc.train, cl=y.train, k=i)
+  validation.error[i] = mean(pred.Yval!=y.train)
+}
+plot(allK, validation.error, type = "l", xlab = "k")
+
+# find best k
+numneighbor = max(allK[validation.error == min(validation.error)])
+print(paste('best k:', numneighbor))
+```
+
+
+```{r}
+# predict on train data
+knn.tr = knn(train=pc.train, test=pc.train, cl=y.train, k=numneighbor)
+
+# confusion matrix on train data
+conf.matrix.tr = table(predicted=knn.tr, true=y.train)
+conf.matrix.tr
+
+# train error
+knn.error.tr <- calc_error_rate(knn.tr, y.train)
+print(paste("knn classification train error:", knn.error.tr))
+
+
+# pca and select min PCs on test data
+election.te.pc <- election.te %>% select(-candidate)
+pr.out.te=prcomp(election.te.pc, scale=TRUE)
+pc.test <- pr.out.te$x[,1:minPC] %>% scale(center = TRUE, scale = TRUE)
+
+# predict on test data
+knn.te = knn(train=pc.train, test=pc.test, cl=y.train, k=numneighbor)
+
+# confusion matrix on train data
+conf.matrix.te = table(predicted=knn.te, true=y.test)
+conf.matrix.te
+
+# train error
+knn.error.te <- calc_error_rate(knn.te, y.test)
+print(paste("knn classification test error:", knn.error.te))
+```
+
+
+```{r}
+# knn classification roc curve
+knn.prob.test <- knn(train=pc.train, test=pc.test, cl=y.train, k=numneighbor, prob = TRUE)
+prob <- attr(knn.prob.test, "prob")
+pred.knn <- prediction(prob, election.te$candidate) 
+perf.knn <- performance(pred.knn, measure="tpr", x.measure="fpr")
+plot(perf.knn, col=5, lwd=3, main="KNN Classification ROC curve")
+abline(0,1)
+```
+
+```{r}
+# plot ROC curves
+plot(perf.tree, col=2, lwd=3, main="ROC curves")
+plot(perf.logistic, add = TRUE, col=3, lwd=3)
+plot(perf.lasso, add = TRUE, col=4, lwd=3)
+plot(perf.knn, add = TRUE, col=5, lwd=3)
+abline(0,1)
+legend("bottomright", legend = c("Decision Tree", "Logistic", "Lasso", "KNN"), col = c(2,3,4,5), lty=1, cex=0.8)
+```
+
+```{r}
+print(records)
+```
+
+From the ROC curve plot, we can see clearly that two parametric models (logistic regression and lasso regression) have better performance than two non-parametric models (decision tree and knn classification) in our case. More specifically, knn classification does not work well in predicting the election winter since its ROC curve is closest to the diagonal and it has the highest train and test errors. 
+
+
+```{r}
+#fit a random forest model
+rf.election = randomForest(candidate~., data=election.tr,importance=TRUE)
+rf.election 
+```
+
+```{r}
+#prediction using random forest and calculate errors
+rf.prob.tr = predict(rf.election ,election.tr, type="prob")
+rf.pred.tr = ifelse(rf.prob.tr[,2]>0.5, "Joe Biden", "Donald Trump")
+rf.error.tr = calc_error_rate(rf.pred.tr, election.tr$candidate)
+print(paste("random forest train error:", rf.error.tr))
+
+rf.prob.te = predict(rf.election , election.te, type="prob")
+rf.pred.te = ifelse(rf.prob.te[,2]>0.5, "Joe Biden", "Donald Trump")
+rf.error.te = calc_error_rate(rf.pred.te, election.te$candidate)
+print(paste("random forest test error:", rf.error.te))
+```
+
+```{r}
+#ROC for the random forest
+rf.pred = prediction(rf.prob.te[,2], election.te$candidate)
+rf.perf = performance(rf.pred, measure="tpr", x.measure="fpr")
+plot(rf.perf , col=2, lwd=3, main="ROC for the random forest")
+abline(0,1)
+```
+
+The training error from the random forest model is 0 which means the model fits the training data perfectly. The test error from the random forest model is 0.0679 which is smaller than the test errors of other classification methods. \newline
+
+20. Since the domination of Joe Biden and Donald Trump in election 2020, we will apply linear regression models for each of them to predict their total vote by county. Then given census of a county, we can predict the votes of Joe Biden or Donald Trump for this particular county. \newline
+
+First, we will create two dataset, and each contains the census by county and their total vote by county. 
+
+```{r}
+# create two election dataset
+election.Biden <- election.raw %>% filter(candidate=='Joe Biden')
+election.Trump <- election.raw %>% filter(candidate=='Donald Trump')
+
+# standardize character values
+tmp.Biden <- election.Biden %>% ungroup %>%
+  mutate_at(vars(state, county), tolower)
+
+tmp.Trump <- election.Trump %>% ungroup %>%
+  mutate_at(vars(state, county), tolower)
+
+# combine election data and census data
+vote.Biden <- tmp.Biden %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+vote.Trump <- tmp.Trump %>%
+  left_join(tmpcensus, by = c("state"="State", "county"="County")) %>% 
+  na.omit
+
+vote.winner <- vote.Biden %>% select(c(state, county, candidate, votes)) %>% 
+  left_join(vote.Trump %>% select(c(state, county, candidate, votes)), by = c("state"="state", "county"="county")) %>% 
+  na.omit
+vote.winner$winner <- ifelse(vote.winner$votes.x > vote.winner$votes.y, "Joe Biden", "Donald Trump")
+  
+# drop categorical variables
+vote.Biden.clean <- vote.Biden %>% select(-c(state, county, candidate, party, CountyId))
+vote.Trump.clean <- vote.Trump %>% select(-c(state, county, candidate, party, CountyId))
+
+# print dimension for dataset
+print(dim(vote.Biden.clean))
+print(dim(vote.Trump.clean))
+print(dim(vote.winner))
+
+# preview for vote.Biden.clean
+head(vote.Biden.clean)
+```
+
+The datasets are ready for splitting into train and test data.
+
+```{r}
+set.seed(10) 
+n <- nrow(vote.Biden.clean)
+idx.tr <- sample.int(n, 0.8*n) 
+
+vote.Biden.tr <- vote.Biden.clean[idx.tr, ]
+vote.Biden.te <- vote.Biden.clean[-idx.tr, ]
+
+vote.Trump.tr <- vote.Trump.clean[idx.tr, ]
+vote.Trump.te <- vote.Trump.clean[-idx.tr, ]
+
+vote.winner.tr <- vote.winner[idx.tr, ]
+vote.winner.te <- vote.winner[-idx.tr, ]
+```
+
+Now, we finished the data pre-processing and can move on fitting linear regression model.
+
+```{r}
+# linear regression model for Biden
+Biden.lm <- lm(votes~., data=vote.Biden.tr)
+summary(Biden.lm)
+
+# MSE on Biden train data 
+pred.tr.B <- predict(Biden.lm, vote.Biden.tr, interval="predict")
+# set negative vote as 0 since vote cannot be negative
+pred.tr.B.cl <- ifelse(pred.tr.B < 0, 0, pred.tr.B)
+MSE.tr.B <- sum((pred.tr.B.cl[,1]-vote.Biden.tr[,1])**2)/nrow(vote.Biden.tr)
+print(paste("MSE on train data:", MSE.tr.B))
+
+# predict and MSE on Biden test data 
+pred.te.B <- predict(Biden.lm, vote.Biden.te, interval="predict")
+pred.te.B.cl <- ifelse(pred.te.B < 0, 0, pred.te.B)
+MSE.te.B <- sum((pred.te.B.cl[,1]-vote.Biden.te[,1])**2)/nrow(vote.Biden.te)
+print(paste("MSE on test data:", MSE.te.B))
+```
+
+
+```{r}
+# linear regression model for Trump
+Trump.lm <- lm(votes~., data=vote.Trump.tr)
+summary(Trump.lm)
+
+# MSE on Trump train data 
+pred.tr.T <- predict(Trump.lm, vote.Trump.tr, interval="predict")
+# set negative vote as 0 since vote cannot be negative
+pred.tr.T.cl <- ifelse(pred.tr.T < 0, 0, pred.tr.T)
+MSE.tr.T <- sum((pred.tr.T.cl[,1]-vote.Trump.tr[,1])**2)/nrow(vote.Trump.tr)
+print(paste("MSE on train data:", MSE.tr.T))
+
+# predict and MSE on Trump test data 
+pred.te.T <- predict(Trump.lm, vote.Trump.te, interval="predict")
+pred.te.T.cl <- ifelse(pred.te.T < 0, 0, pred.te.T)
+MSE.te.T <- sum((pred.te.T.cl[,1]-vote.Trump.te[,1])**2)/nrow(vote.Trump.te)
+print(paste("MSE on test data:", MSE.te.T))
+```
+
+```{r}
+# train and test error
+tr.winner <- ifelse(pred.tr.B.cl > pred.tr.T.cl, "Joe Biden", "Donald Trump")
+pred.winner <- ifelse(pred.te.B.cl > pred.te.T.cl, "Joe Biden", "Donald Trump")
+
+print(paste("linear regression train error:", calc_error_rate(tr.winner[,1], vote.winner.tr$winner)))
+print(paste("linear regression test error:", calc_error_rate(pred.winner[,1], vote.winner.te$winner)))
+```
+
+
+We can the mean squared errors of train data and test data for both Biden and Trump are extremely high which means the linear regression models could be inaccurate. Linear regression model of Biden data has important variables **TotalPop**, **White**, **VotingAgeCitizen**, **Professional**, **Office**, **OtherTransp** and **PrivateWork**. Linear regression model of Trump data has important variables **TotalPop**, **VotingAgeCitizen**, **Professional**, **Service**, **Office**, **Drive**, **Transit**, **WorkAtHome**, **Employed**, **PrivateWork** and **SelfEmployed**. \newline
+
+Compared to the results of classification models, the linear regression model has the highest train and test error which means the model is not as effective and accurate as classification models in predicting election winner by county. Therefore, in terms of accuracy, we prefer classification models. However, the advantage is linear regression model is that we can numerically calculate the votes for either candidate which gives us more details about the winner instead of knowing the binary results (winner or not) only. Therefore, linear regression model is better at provide more details but classification models have higher accuracy. 
+
+21.
+```{r}
+#AUC for the best pruned decision tree
+auc.best.tree = performance(pred.tree, "auc")@y.values
+auc.best.tree
+print(paste("AUC for decision tree:", auc.best.tree))
+#AUC for the logistic regression fit
+auc.glm = performance(pred.logistic, "auc")@y.values
+auc.glm
+print(paste("AUC for logistic regression fit:", auc.glm))
+#AUC for the lasso regression model
+auc.lasso = performance(pred.lasso, "auc")@y.values
+auc.lasso
+print(paste("AUC for lasso regression model:", auc.lasso))
+#AUC for the knn
+auc.knn = performance(pred.knn, "auc")@y.values
+auc.knn
+print(paste("AUC for knn classification:", auc.knn))
+#AUC for the random forest
+auc.rf = performance(rf.pred, "auc")@y.values
+auc.rf
+print(paste("AUC for random forest:", auc.rf))
+
+```
+
+Among all the methods, we found logistic regression method has the best performance in predicting the president candidate. Logistics regression method has the largest AUC value and has relatively low training and test errors compared to other methods. Random Forest classification has the lowest test error and its AUC value is the second largest one among the four classification methods. Therefore, in this analysis logistics regression seems to be the best method. However, it assumes a linear relationship between the predictors and the response and we don’t know if that’s the true case. With a complex dataset like this one which has many predictors and observations, a non-parametric classification method seems to be more appropriate because it does not assume any relationships between the predictors and the response. However, our non-parametric models in this analysis did not perform better especially the KNN method. \newline
+
+Furthermore, although there are lots of information in this dataset to predict the winner of president candidate, most information don’t seem to be relevant such as information about people’s occupations. We think it might be due to such information being to general. Information about specific industries that people work in might be more helpful in predicting winner of president candidate. 
+
+
+
+
